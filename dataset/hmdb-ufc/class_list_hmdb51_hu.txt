@@ -1,0 +1,7 @@
+0 climb
+1 dive
+2 fencing
+3 golf
+4 handstand
+5 kick_ball
+6 pullup

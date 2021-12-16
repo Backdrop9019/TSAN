@@ -1,0 +1,14 @@
+0 shoot_bow
+1 shoot_ball
+2 ride_bike
+3 dive
+4 fencing
+5 golf
+6 handstand
+7 ride_horse
+8 pullup
+9 punch
+10 pushup
+11 climb
+12 kick_ball
+13 walk

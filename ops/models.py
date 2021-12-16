@@ -8,6 +8,7 @@ from torch import nn
 from ops.basic_ops import ConsensusModule
 from ops.transforms import *
 from torch.nn.init import normal_, constant_
+import torch.nn.functional as F
 
 
 class TSN(nn.Module):
@@ -259,15 +260,13 @@ class TSN(nn.Module):
             {'params': lr10_bias, 'lr_mult': 10, 'decay_mult': 0,
              'name': "lr10_bias"},
         ]
+    def set_lambda(self, lambd):
+        self.lambd = lambd
+    def forward(self, input, no_reshape=False,reverse=False):
 
-    def forward(self, input, no_reshape=False):
+
         if not no_reshape:
             sample_len = (3 if self.modality == "RGB" else 2) * self.new_length
-
-            if self.modality == 'RGBDiff':
-                sample_len = 3 * self.new_length
-                input = self._get_diff(input)
-
             base_out = self.base_model(input.view((-1, sample_len) + input.size()[-2:]))
         else:
             base_out = self.base_model(input)
@@ -276,14 +275,18 @@ class TSN(nn.Module):
             base_out = self.new_fc(base_out)
 
         if not self.before_softmax:
+            print("do softmax")
             base_out = self.softmax(base_out)
+
 
         if self.reshape:
             if self.is_shift and self.temporal_pool:
                 base_out = base_out.view((-1, self.num_segments // 2) + base_out.size()[1:])
             else:
                 base_out = base_out.view((-1, self.num_segments) + base_out.size()[1:])
+            # base_out.shape [16,8,8]
             output = self.consensus(base_out)
+            # output.shape [16,1,8]
             return output.squeeze(1)
 
     def _get_diff(self, input, keep_rgb=False):
@@ -392,3 +395,42 @@ class TSN(nn.Module):
         elif self.modality == 'RGBDiff':
             return torchvision.transforms.Compose([GroupMultiScaleCrop(self.input_size, [1, .875, .75]),
                                                    GroupRandomHorizontalFlip(is_flow=False)])
+class Classifier(nn.Module):
+    def __init__(self, num_classes=8):
+        super(Classifier, self).__init__()
+        self.fc1 = nn.Linear(8, 100)
+        self.bn1 = nn.BatchNorm1d(100, affine=True)
+        self.fc2 = nn.Linear(100, 100)
+        self.bn2 = nn.BatchNorm1d(100, affine=True)
+        self.fc3 = nn.Linear(100, num_classes)
+
+    def forward(self, x, dropout=False, return_feat=False, reverse=False):
+        if reverse:
+            x = grad_reverse(x)
+            feat = x
+            x = self.fc1(x)
+
+        else:
+            feat = x
+            x = self.fc1(x)
+        if return_feat:
+            return x, feat
+        x = F.relu(self.bn1(x))
+        x = F.relu(self.bn2(self.fc2(x)))
+        x = self.fc3(x)
+
+        
+        return x
+
+from torch.autograd import Function
+class GradReverse(Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg()
+
+def grad_reverse(x):
+    return GradReverse.apply(x)

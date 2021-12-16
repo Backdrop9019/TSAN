@@ -1,0 +1,7 @@
+0 Archery
+1 Basketball
+2 Biking
+3 Diving
+4 Fencing
+5 GolfSwing
+6 HandstandWalking

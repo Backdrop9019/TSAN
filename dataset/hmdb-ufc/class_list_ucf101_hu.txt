@@ -1,0 +1,14 @@
+0 RockClimbingIndoor
+1 Diving
+2 Fencing
+3 GolfSwing
+4 HandstandWalking
+5 SoccerPenalty
+6 PullUps
+7 Punch
+8 PushUps
+9 Biking
+10 HorseRiding
+11 Basketball
+12 Archery
+13 WalkingWithDog

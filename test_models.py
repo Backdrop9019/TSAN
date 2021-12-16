@@ -12,7 +12,7 @@ import torch.nn.parallel
 import torch.optim
 from sklearn.metrics import confusion_matrix
 from ops.dataset import TSNDataSet
-from ops.models import TSN
+from ops.models import TSN,Classifier
 from ops.transforms import *
 from ops import dataset_config
 from torch.nn import functional as F
@@ -28,6 +28,7 @@ parser.add_argument('--dense_sample', default=False, action="store_true", help='
 parser.add_argument('--twice_sample', default=False, action="store_true", help='use twice sample for ensemble')
 parser.add_argument('--full_res', default=False, action="store_true",
                     help='use full resolution 256x256 for test as in Non-local I3D')
+parser.add_argument('--threshold', type=bool, default=False)
 
 parser.add_argument('--test_crops', type=int, default=1)
 parser.add_argument('--coeff', type=str, default=None)
@@ -79,7 +80,7 @@ def accuracy(output, target, topk=(1,)):
     correct = pred.eq(target.view(1, -1).expand_as(pred))
     res = []
     for k in topk:
-         correct_k = correct[:k].view(-1).float().sum(0)
+         correct_k = correct[:k].reshape(-1).float().sum(0)
          res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
@@ -96,6 +97,7 @@ def parse_shift_option_from_log_name(log_name):
 
 
 weights_list = args.weights.split(',')
+print(weights_list)
 test_segments_list = [int(s) for s in args.test_segments.split(',')]
 assert len(weights_list) == len(test_segments_list)
 if args.coeff is None:
@@ -111,6 +113,7 @@ else:
 
 data_iter_list = []
 net_list = []
+c_list = []
 modality_list = []
 
 total_num = None
@@ -125,7 +128,8 @@ for this_weights, this_test_segments, test_file in zip(weights_list, test_segmen
     num_class, args.train_list, val_list, root_path, prefix = dataset_config.return_dataset(args.dataset,
                                                                                             modality)
     print('=> shift: {}, shift_div: {}, shift_place: {}'.format(is_shift, shift_div, shift_place))
-    net = TSN(num_class, this_test_segments if is_shift else 1, modality,
+    print(f'test val list : {val_list}')
+    net = TSN(8, this_test_segments if is_shift else 1, modality,
               base_model=this_arch,
               consensus_type=args.crop_fusion_type,
               img_feature_dim=args.img_feature_dim,
@@ -133,13 +137,16 @@ for this_weights, this_test_segments, test_file in zip(weights_list, test_segmen
               is_shift=is_shift, shift_div=shift_div, shift_place=shift_place,
               non_local='_nl' in this_weights,
               )
-
+    C =Classifier(num_classes=8)
+    temp = torch.load(args.weights)
+    dict = { '.'.join(k.split('.')[1:]): v   for k, v in temp['state_CLS_dict'].items()}
+    C.load_state_dict(dict)
     if 'tpool' in this_weights:
         from ops.temporal_shift import make_temporal_pool
         make_temporal_pool(net.base_model, this_test_segments)  # since DataParallel
 
     checkpoint = torch.load(this_weights)
-    checkpoint = checkpoint['state_dict']
+    checkpoint = checkpoint['state_TSN_dict']
 
     # base_dict = {('base_model.' + k).replace('base_model.fc', 'new_fc'): v for k, v in list(checkpoint.items())}
     base_dict = {'.'.join(k.split('.')[1:]): v for k, v in list(checkpoint.items())}
@@ -151,7 +158,6 @@ for this_weights, this_test_segments, test_file in zip(weights_list, test_segmen
             base_dict[v] = base_dict.pop(k)
 
     net.load_state_dict(base_dict)
-
     input_size = net.scale_size if args.full_res else net.input_size
     if args.test_crops == 1:
         cropping = torchvision.transforms.Compose([
@@ -189,6 +195,7 @@ for this_weights, this_test_segments, test_file in zip(weights_list, test_segmen
             batch_size=args.batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True,
     )
+    print(f'test_file : {test_file}')
 
     if args.gpus is not None:
         devices = [args.gpus[i] for i in range(args.workers)]
@@ -196,7 +203,9 @@ for this_weights, this_test_segments, test_file in zip(weights_list, test_segmen
         devices = list(range(args.workers))
 
     net = torch.nn.DataParallel(net.cuda())
+    C = torch.nn.DataParallel(C.cuda())
     net.eval()
+    C.eval()
 
     data_gen = enumerate(data_loader)
 
@@ -207,12 +216,13 @@ for this_weights, this_test_segments, test_file in zip(weights_list, test_segmen
 
     data_iter_list.append(data_gen)
     net_list.append(net)
-
+    c_list.append(C)
 
 output = []
 
 
-def eval_video(video_data, net, this_test_segments, modality):
+
+def eval_video(video_data, net,C, this_test_segments, modality):
     net.eval()
     with torch.no_grad():
         i, data, label = video_data
@@ -237,6 +247,7 @@ def eval_video(video_data, net, this_test_segments, modality):
         if is_shift:
             data_in = data_in.view(batch_size * num_crop, this_test_segments, length, data_in.size(2), data_in.size(3))
         rst = net(data_in)
+        rst = C(rst)
         rst = rst.reshape(batch_size, num_crop, -1).mean(1)
 
         if args.softmax:
@@ -259,14 +270,24 @@ max_num = args.max_num if args.max_num > 0 else total_num
 top1 = AverageMeter()
 top5 = AverageMeter()
 
+
+def threshold(predict):
+    # source only 0.4
+    # dann 0.5 54%
+    if any(predict > 0.5):
+      after_tune.append(predict)
+    else:
+      after_tune.append(np.asarray([0,0,0,0,0,0,0,1]).astype(np.float32))
+    
+
 for i, data_label_pairs in enumerate(zip(*data_iter_list)):
     with torch.no_grad():
         if i >= max_num:
             break
         this_rst_list = []
         this_label = None
-        for n_seg, (_, (data, label)), net, modality in zip(test_segments_list, data_label_pairs, net_list, modality_list):
-            rst = eval_video((i, data, label), net, n_seg, modality)
+        for n_seg, (_, (data, label)), net, C,modality in zip(test_segments_list, data_label_pairs, net_list,c_list, modality_list):
+            rst = eval_video((i, data, label), net, C, n_seg, modality)
             this_rst_list.append(rst[1])
             this_label = label
         assert len(this_rst_list) == len(coeff_list)
@@ -277,7 +298,18 @@ for i, data_label_pairs in enumerate(zip(*data_iter_list)):
         for p, g in zip(ensembled_predict, this_label.cpu().numpy()):
             output.append([p[None, ...], g])
         cnt_time = time.time() - proc_start_time
-        prec1, prec5 = accuracy(torch.from_numpy(ensembled_predict), this_label, topk=(1, 5))
+        
+        if args.threshold:
+            after_tune = []
+            np.apply_along_axis(threshold, axis=1, arr=ensembled_predict)
+            after_tune = np.asarray(after_tune)
+            predict = torch.from_numpy(after_tune)
+            prec1, prec5 = accuracy(predict, this_label, topk=(1, 5))
+
+        else:
+            prec1, prec5 = accuracy(torch.from_numpy(ensembled_predict), this_label, topk=(1, 5))
+
+
         top1.update(prec1.item(), this_label.numel())
         top5.update(prec5.item(), this_label.numel())
         if i % 20 == 0:
@@ -327,5 +359,4 @@ print('upper bound: {}'.format(upper))
 print('-----Evaluation is finished------')
 print('Class Accuracy {:.02f}%'.format(np.mean(cls_acc) * 100))
 print('Overall Prec@1 {:.02f}% Prec@5 {:.02f}%'.format(top1.avg, top5.avg))
-
 
